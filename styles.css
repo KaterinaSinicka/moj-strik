@@ -152,3 +152,16 @@ nav button.on{color:var(--accent)}
 .code{font-family:var(--display);font-size:1.4rem;letter-spacing:.08em}
 .grouprow{display:flex;gap:8px;margin-top:10px}
 .grouprow input{text-transform:uppercase}
+/* activities */
+.chip .x{border:0;background:none;color:inherit;font-weight:800;margin-left:6px;padding:0 2px;font-size:1rem;line-height:1}
+.cg{font-family:var(--body);font-size:.9rem;font-weight:800;color:var(--muted);margin:18px 0 8px}
+.customrow{display:grid;grid-template-columns:64px 1fr auto;gap:8px}
+.customrow input{padding:10px 12px}
+.counts div{font-size:.85rem}
+/* workout time */
+.prow2{flex-wrap:wrap}
+.prow2 .chips{flex-basis:100%}
+.ptime{width:auto;padding:5px 8px;font-size:.85rem;border-radius:10px}
+.wotl{display:flex;align-items:center;gap:8px;margin-top:8px;font-weight:600;font-size:.85rem}
+.wotl input{width:auto;padding:5px 8px;font-size:.9rem;border-radius:10px;border:0}
+.week small{display:block;font-size:.68rem;min-height:1em}
