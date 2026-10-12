@@ -1,0 +1,503 @@
+import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+import { getAuth, onAuthStateChanged, signInWithEmailAndPassword, createUserWithEmailAndPassword,
+  sendPasswordResetEmail, signOut } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+import { initializeFirestore, persistentLocalCache, persistentMultipleTabManager, doc, getDoc, setDoc,
+  deleteDoc, collection, onSnapshot, arrayUnion } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+import { getMessaging, getToken, onMessage, isSupported } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-messaging.js";
+
+const fbApp = initializeApp(self.FIREBASE_CONFIG);
+const auth = getAuth(fbApp);
+const fs = initializeFirestore(fbApp, { localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() }) });
+let swReg = null, messaging = null;
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("./sw.js").then(r => swReg = r).catch(console.warn);
+
+/* ---------- constants ---------- */
+const TYPES={leg:{e:"🦵",n:"Leg day"},arm:{e:"💪",n:"Arm day"},cardio:{e:"🏃‍♀️",n:"Кардио"},rest:{e:"😴",n:"Отдых"}};
+const DOW=["Вс","Пн","Вт","Ср","Чт","Пт","Сб"];
+const WEEK_ORDER=[1,2,3,4,5,6,0];
+const DEF_PLAN={1:"leg",2:"cardio",3:"arm",4:"rest",5:"leg",6:"cardio",0:"rest"};
+const MEALS=[{k:"b",n:"Завтрак",e:"🍳",h:11,msg:"Завтрак сам себя не съест 🍳"},{k:"l",n:"Обед",e:"🥗",h:16,msg:"Обед ждёт тебя, а ты его игноришь 🥗"},{k:"d",n:"Ужин",e:"🍲",h:21,msg:"Ужин тоже считается, не забудь отметить 🍲"}];
+const TIERS={bronze:{n:"Бронза",c:"var(--bronze)"},silver:{n:"Серебро",c:"var(--silver)"},gold:{n:"Золото",c:"var(--gold)"},plat:{n:"Платина",c:"var(--plat)"}};
+const TROPHIES=[
+ {id:"first",t:"bronze",e:"⚖️",n:"Первый шаг",d:"Первое взвешивание",p:s=>[s.weighIns,1]},
+ {id:"fullday",t:"bronze",e:"✅",n:"Идеальный день",d:"Вес, три приёма пищи и тренировка за один день",p:s=>[s.full,1]},
+ {id:"s3",t:"bronze",e:"🔥",n:"Разогрев",d:"Стрик 3 дня",p:s=>[s.best,3]},
+ {id:"photo10",t:"bronze",e:"📸",n:"Фуд-блогер",d:"10 фото еды",p:s=>[s.photos,10]},
+ {id:"wo5",t:"bronze",e:"🏋️‍♀️",n:"Втянулась",d:"5 тренировок",p:s=>[s.wo,5]},
+ {id:"s7",t:"silver",e:"🔥",n:"Неделя огня",d:"Стрик 7 дней",p:s=>[s.best,7]},
+ {id:"leg10",t:"silver",e:"🦵",n:"Железные ноги",d:"10 leg day",p:s=>[s.by.leg,10]},
+ {id:"arm10",t:"silver",e:"💪",n:"Руки-базуки",d:"10 arm day",p:s=>[s.by.arm,10]},
+ {id:"cardio10",t:"silver",e:"🏃‍♀️",n:"Неутомимая",d:"10 кардио",p:s=>[s.by.cardio,10]},
+ {id:"w30",t:"silver",e:"🗓️",n:"Ритуал",d:"30 утренних взвешиваний",p:s=>[s.weighIns,30]},
+ {id:"q25",t:"silver",e:"📉",n:"Четверть пути",d:"25% цели",p:s=>[s.pct,25]},
+ {id:"s30",t:"gold",e:"🔥",n:"Месяц без пропусков",d:"Стрик 30 дней",p:s=>[s.best,30]},
+ {id:"wo50",t:"gold",e:"🏆",n:"Зверь в зале",d:"50 тренировок",p:s=>[s.wo,50]},
+ {id:"q50",t:"gold",e:"⛰️",n:"Экватор",d:"Половина цели",p:s=>[s.pct,50]},
+ {id:"plat",t:"plat",e:"💎",n:"Цель достигнута",d:"100% цели",p:s=>[s.pct,100]}
+];
+
+/* ---------- utils ---------- */
+const $=s=>document.querySelector(s);
+const esc=s=>String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const pad=n=>String(n).padStart(2,"0");
+const keyOf=d=>d.getFullYear()+"-"+pad(d.getMonth()+1)+"-"+pad(d.getDate());
+const parseKey=k=>{const [y,m,d]=k.split("-").map(Number);return new Date(y,m-1,d)};
+const addDays=(k,n)=>{const d=parseKey(k);d.setDate(d.getDate()+n);return keyOf(d)};
+const todayKey=()=>keyOf(new Date());
+const num=v=>{const n=parseFloat(String(v).replace(",","."));return isFinite(n)?n:null};
+const fmt=n=>(Math.round(n*10)/10).toString().replace(".",",");
+const clone=o=>JSON.parse(JSON.stringify(o));
+
+/* ---------- state ---------- */
+let uid=null, st=null, photos={}, board=[], tab="today", pendingMeal=null, unsubGroup=null, authMode="login";
+
+const chains={};
+function serial(key,fn){chains[key]=(chains[key]||Promise.resolve()).then(fn).catch(onWriteErr);return chains[key]}
+function onWriteErr(e){
+  console.error(e);
+  if(e&&e.code==="permission-denied")toastText("Нет доступа","Проверь правила Firestore");
+  else if(e&&e.code==="resource-exhausted")toastText("Лимит Firebase на сегодня","Попробуй позже");
+  else toastText("Не сохранилось","Проверь интернет, попробуем ещё раз при следующем изменении");
+}
+let saveT=null;
+function save(){
+  clearTimeout(saveT);
+  saveT=setTimeout(()=>{if(!uid)return;const snap=clone(st);serial("state",()=>setDoc(doc(fs,"users",uid),snap));pushBoard()},500);
+}
+
+/* ---------- logic ---------- */
+function day(k){return st.log[k]||(st.log[k]={})}
+function planFor(k){return st.plan[parseKey(k).getDay()]||"rest"}
+function isFull(k){
+  const d=st.log[k];if(!d)return false;
+  return d.w!=null&&d.b&&d.l&&d.d&&(planFor(k)==="rest"||!!d.wo);
+}
+function currentWeight(){
+  const ks=Object.keys(st.log).filter(k=>st.log[k].w!=null).sort();
+  return ks.length?st.log[ks[ks.length-1]].w:st.start;
+}
+function pctGoal(){
+  const span=st.start-st.goal;if(!span)return 0;
+  const p=(st.start-currentWeight())/span*100;
+  return Math.max(0,Math.min(100,Math.round(p)));
+}
+function streakNow(){
+  let k=todayKey();if(!isFull(k))k=addDays(k,-1);
+  let n=0;while(isFull(k)){n++;k=addDays(k,-1)}
+  return n;
+}
+function stats(){
+  const ks=Object.keys(st.log).sort();
+  const s={weighIns:0,photos:0,full:0,wo:0,by:{leg:0,arm:0,cardio:0},best:0,pct:pctGoal()};
+  for(const k of ks){
+    const d=st.log[k];
+    if(d.w!=null)s.weighIns++;
+    s.photos+=["b","l","d"].filter(m=>d["p"+m]).length;
+    if(d.wo&&s.by[d.wo]!=null){s.wo++;s.by[d.wo]++}
+    if(isFull(k))s.full++;
+  }
+  if(ks.length){
+    let k=ks[0],run=0;const end=todayKey();
+    while(k<=end){if(isFull(k)){run++;s.best=Math.max(s.best,run)}else run=0;k=addDays(k,1)}
+  }
+  return s;
+}
+function checkTrophies(silent){
+  const s=stats();st.unlocked=st.unlocked||{};const fresh=[];
+  for(const t of TROPHIES){const [v,goal]=t.p(s);if(v>=goal&&!st.unlocked[t.id]){st.unlocked[t.id]=todayKey();fresh.push(t)}}
+  if(fresh.length&&!silent){fresh.forEach((t,i)=>setTimeout(()=>toastTrophy(t),i*3800));save()}
+  return fresh;
+}
+function paceText(start,goal,deadline){
+  if(start==null||goal==null||!deadline)return "";
+  const days=(parseKey(deadline)-parseKey(todayKey()))/864e5;
+  if(days<=0)return "Выбери дату в будущем.";
+  const perWeek=Math.abs(start-goal)/(days/7);
+  let t="Темп: примерно "+fmt(perWeek)+" кг в неделю.";
+  if(perWeek>1)t+=" Это быстрее, чем обычно советуют (0,5–1 кг в неделю). Можно, но прислушивайся к самочувствию.";
+  return t;
+}
+
+/* ---------- group (together) ---------- */
+let lastBoard="";
+function boardBody(){
+  const k=todayKey(),d=st.log[k]||{};
+  return {nick:st.nick.slice(0,30),pct:pctGoal(),streak:streakNow(),trophies:Object.keys(st.unlocked||{}).length,
+    day:k,w:d.w!=null,m:["b","l","d"].filter(m=>d[m]).length,wo:!!d.wo,rest:planFor(k)==="rest"};
+}
+function pushBoard(force){
+  if(!uid||!st||!st.nick||!st.group)return Promise.resolve();
+  const body=boardBody(),j=JSON.stringify(body);
+  if(j===lastBoard&&!force)return Promise.resolve();lastBoard=j;
+  const g=st.group;
+  return serial("board",()=>setDoc(doc(fs,"groups",g,"members",uid),{...body,upd:Date.now()}));
+}
+function subscribeGroup(){
+  if(unsubGroup){unsubGroup();unsubGroup=null}
+  board=[];if(!st.group)return;
+  unsubGroup=onSnapshot(collection(fs,"groups",st.group,"members"),snap=>{
+    board=snap.docs.map(d=>({id:d.id,...d.data()}));
+    if(tab==="together")render();
+  },e=>console.warn("group",e));
+}
+function newCode(){
+  const a="ABCDEFGHJKLMNPQRSTUVWXYZ23456789";let s="";
+  const r=crypto.getRandomValues(new Uint32Array(8));for(const x of r)s+=a[x%a.length];return s;
+}
+async function joinGroup(code){
+  code=String(code||"").trim().toUpperCase();
+  if(!/^[A-Z0-9]{6,12}$/.test(code)){toastText("Неверный код","6–12 букв и цифр");return}
+  if(st.group&&st.group!==code)await leaveGroup(true);
+  st.group=code;lastBoard="";
+  await pushBoard(true);
+  subscribeGroup();save();render();
+}
+async function leaveGroup(quiet){
+  if(!st.group)return;
+  const g=st.group;
+  if(unsubGroup){unsubGroup();unsubGroup=null}
+  try{await deleteDoc(doc(fs,"groups",g,"members",uid))}catch(e){console.warn(e)}
+  st.group=null;board=[];lastBoard="";
+  if(!quiet){save();render()}
+}
+
+/* ---------- notifications ---------- */
+const isIOS=/iphone|ipad|ipod/i.test(navigator.userAgent);
+const isStandalone=matchMedia("(display-mode: standalone)").matches||navigator.standalone===true;
+async function initMessaging(){
+  if(messaging)return messaging;
+  if(!(await isSupported().catch(()=>false)))return null;
+  messaging=getMessaging(fbApp);
+  onMessage(messaging,p=>toastText(p.notification?.title||"Мой стрик",p.notification?.body||""));
+  return messaging;
+}
+async function registerToken(){
+  const m=await initMessaging();if(!m)return false;
+  const reg=swReg||await navigator.serviceWorker.ready;
+  const token=await getToken(m,{vapidKey:self.VAPID_KEY,serviceWorkerRegistration:reg});
+  if(!token)return false;
+  await setDoc(doc(fs,"tokens",uid),{tokens:arrayUnion(token)},{merge:true});
+  return true;
+}
+async function enableNotifications(){
+  if(isIOS&&!isStandalone){toastText("Сначала на экран Домой","В Safari: Поделиться → На экран Домой, потом открой приложение с иконки");return}
+  if(!("Notification" in window)||!(await initMessaging())){toastText("Этот браузер не умеет push","Попробуй Chrome на Android или установленное приложение на iPhone");return}
+  const perm=await Notification.requestPermission();
+  if(perm!=="granted"){toastText("Уведомления запрещены","Разреши их в настройках браузера для этого сайта");return}
+  try{
+    if(await registerToken()){st.remind.on=true;save();render();toastText("Уведомления включены 🔔","Напомню про вес, еду и стрик")}
+  }catch(e){console.error(e);toastText("Не получилось включить","Проверь VAPID_KEY в firebase-config.js")}
+}
+function notifStatus(){
+  if(!("Notification" in window))return isIOS&&!isStandalone?"На iPhone уведомления работают только в приложении с экрана Домой.":"Этот браузер не поддерживает push-уведомления.";
+  if(Notification.permission==="denied")return "Уведомления запрещены в настройках браузера.";
+  if(Notification.permission==="granted"&&st.remind.on)return "Уведомления включены на этом устройстве ✅";
+  return "Уведомления выключены.";
+}
+
+/* ---------- photos ---------- */
+function compress(file){
+  return new Promise((res,rej)=>{
+    const img=new Image(),url=URL.createObjectURL(file);
+    img.onload=()=>{
+      const max=560,sc=Math.min(1,max/Math.max(img.width,img.height));
+      const c=document.createElement("canvas");c.width=Math.round(img.width*sc);c.height=Math.round(img.height*sc);
+      c.getContext("2d").drawImage(img,0,0,c.width,c.height);URL.revokeObjectURL(url);
+      let q=.7,out=c.toDataURL("image/jpeg",q);
+      while(out.length>75000&&q>.3){q-=.1;out=c.toDataURL("image/jpeg",q)}
+      res(out);
+    };
+    img.onerror=()=>{URL.revokeObjectURL(url);rej(new Error("img"))};
+    img.src=url;
+  });
+}
+$("#photo").addEventListener("change",async e=>{
+  const f=e.target.files[0];e.target.value="";if(!f||!pendingMeal)return;
+  const m=pendingMeal;pendingMeal=null;
+  try{
+    const data=await compress(f),k=todayKey();
+    photos[k]=photos[k]||{};photos[k][m]=data;
+    const d=day(k);d[m]=true;d["p"+m]=true;
+    const snap=clone(photos[k]);serial("ph",()=>setDoc(doc(fs,"users",uid,"photos",k),snap));
+    checkTrophies();save();render();
+  }catch(err){toastText("Не получилось загрузить фото","Попробуй другое изображение")}
+});
+
+/* ---------- toast ---------- */
+let toastT=null;
+function showToast(html){
+  const t=$("#toast");t.innerHTML=html;t.classList.add("show");
+  clearTimeout(toastT);toastT=setTimeout(()=>t.classList.remove("show"),3800);
+}
+function toastTrophy(t){
+  const prize=(st.prizes||{})[t.id];
+  showToast(`<div class="tin"><div class="medal" style="--tc:${TIERS[t.t].c}">${t.e}</div><div><b>Трофей получен: ${esc(t.n)}</b><small>${prize?"🎁 Приз: "+esc(prize):TIERS[t.t].n}</small></div></div>`);
+}
+function toastText(a,b){showToast(`<div class="tin"><div><b>${esc(a)}</b><small>${esc(b)}</small></div></div>`)}
+
+/* ---------- views ---------- */
+function nudges(){
+  const h=new Date().getHours(),k=todayKey(),d=st.log[k]||{},out=[];
+  if(d.w==null&&h>=10)out.push("Весы скучают ⚖️ Ты ещё не взвесилась сегодня.");
+  for(const m of MEALS)if(!d[m.k]&&h>=m.h)out.push(m.msg);
+  if(h>=20&&!isFull(k)){const s=streakNow();if(s>0)out.push(`До полуночи закрой день, иначе стрик 🔥${s} сгорит.`)}
+  return out;
+}
+function chartSVG(){
+  const pts=Object.keys(st.log).filter(k=>st.log[k].w!=null).sort().slice(-60).map(k=>({k,w:st.log[k].w}));
+  if(pts.length<2)return `<p class="muted small">График появится после второго взвешивания.</p>`;
+  const W=320,H=140,px=8,py=14;
+  const ws=pts.map(p=>p.w).concat([st.goal]);const lo=Math.min(...ws)-.5,hi=Math.max(...ws)+.5;
+  const x=i=>px+i*(W-2*px)/(pts.length-1),y=w=>py+(hi-w)*(H-2*py)/(hi-lo);
+  const line=pts.map((p,i)=>(i?"L":"M")+x(i).toFixed(1)+" "+y(p.w).toFixed(1)).join(" ");
+  const last=pts[pts.length-1];
+  return `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="График веса">
+    <line x1="${px}" x2="${W-px}" y1="${y(st.goal)}" y2="${y(st.goal)}" stroke="var(--ok)" stroke-dasharray="4 4" stroke-width="1.5"/>
+    <text x="${W-px}" y="${y(st.goal)-4}" text-anchor="end" font-size="10" fill="var(--ok)" font-family="Manrope">цель ${fmt(st.goal)}</text>
+    <path d="${line}" fill="none" stroke="var(--accent)" stroke-width="2.5" stroke-linejoin="round" stroke-linecap="round"/>
+    <circle cx="${x(pts.length-1)}" cy="${y(last.w)}" r="4.5" fill="var(--accent)"/>
+  </svg>`;
+}
+function viewToday(){
+  const k=todayKey(),d=st.log[k]||{},s=streakNow(),plan=planFor(k),T=TYPES[plan],ph=photos[k]||{};
+  const cw=currentWeight(),diff=cw-st.start;
+  const meals=MEALS.map(m=>{const img=ph[m.k];return `
+    <div class="meal ${d[m.k]?"done":""} ${img?"hasimg":""}">
+      ${img?`<img src="${img}" alt="Фото: ${m.n}">`:`<span class="emo" aria-hidden="true">${m.e}</span>`}
+      <button class="chk" data-act="meal" data-m="${m.k}" aria-label="${d[m.k]?"Снять отметку":"Отметить"}: ${m.n}">${d[m.k]?"✓":""}</button>
+      <button class="lab" data-act="photo" data-m="${m.k}" style="all:unset;position:relative;z-index:1;font-weight:700;font-size:.9rem;cursor:pointer">${m.n}<br><span class="small" style="font-weight:500">${img?"заменить фото":"+ фото"}</span></button>
+    </div>`}).join("");
+  const nd=nudges();
+  return `
+  <div class="top">
+    <div><p class="muted">${new Date().toLocaleDateString("ru-RU",{weekday:"long",day:"numeric",month:"long"})}</p><h1>Привет, ${esc(st.nick)}</h1></div>
+    <div class="flame ${s?"":"cold"}"><b>🔥${s}</b><span>${s===1?"день":"дней"} подряд</span></div>
+  </div>
+  ${nd.length?`<div class="nudges">${nd.map(t=>`<div class="nudge">${esc(t)}</div>`).join("")}</div>`:""}
+  <div class="weigh">
+    <div class="grow">${d.w!=null
+      ?`<div class="num">${fmt(d.w)}<small>кг</small></div><p class="small muted">${diff<=0?"−"+fmt(-diff):"+"+fmt(diff)} кг от старта</p>`
+      :`<p style="font-weight:700">Утреннее взвешивание</p><p class="small muted">Натощак, до завтрака</p>`}</div>
+    <input id="w" inputmode="decimal" placeholder="${fmt(cw)}" aria-label="Вес в кг" value="${d.w!=null?fmt(d.w):""}">
+    <button class="btn" data-act="weigh">${d.w!=null?"Обновить":"Сохранить"}</button>
+  </div>
+  <h2>Еда сегодня</h2>
+  <div class="meals">${meals}</div>
+  <p class="small muted mealhint">Нажми на название, чтобы добавить фото. Фото видишь только ты.</p>
+  <h2>Тренировка</h2>
+  <div class="band ${plan==="rest"?"rest":""} ${d.wo?"isdone":""}">
+    <span class="big" aria-hidden="true">${T.e}</span>
+    <div class="grow"><h3>${T.n}</h3><p class="small">${plan==="rest"?"Сегодня отдыхаем, это тоже часть плана.":d.wo?"Сделано, ты молодец!":"По плану на сегодня"}</p></div>
+    ${plan==="rest"?"":`<button class="btn" data-act="wo">${d.wo?"✓ Сделала":"Отметить"}</button>`}
+  </div>
+  <h2>Путь к цели</h2>
+  <div class="prow"><b>${pctGoal()}%</b><span class="muted small">${fmt(st.start)} → ${fmt(st.goal)} кг до ${parseKey(st.deadline).toLocaleDateString("ru-RU",{day:"numeric",month:"long"})}</span></div>
+  <div class="bar"><i style="width:${pctGoal()}%"></i></div>
+  <div class="chart">${chartSVG()}</div>`;
+}
+function viewGym(){
+  const tk=todayKey(),tdow=parseKey(tk).getDay(),s=stats();
+  const start=addDays(tk,-((tdow+6)%7));
+  const week=[0,1,2,3,4,5,6].map(i=>{const k=addDays(start,i),p=planFor(k),d=st.log[k]||{};
+    const mark=p==="rest"?"😴":d.wo?"✅":k<tk?"✖️":TYPES[p].e;
+    return `<div><span class="muted">${DOW[parseKey(k).getDay()]}</span><b>${mark}</b></div>`}).join("");
+  const rows=WEEK_ORDER.map(w=>`<div class="prow2 ${w===tdow?"today":""}"><span class="dn">${DOW[w]}</span><div class="chips">${
+    Object.entries(TYPES).map(([id,t])=>`<button class="chip ${st.plan[w]===id?"on":""}" data-act="plan" data-d="${w}" data-t="${id}" aria-pressed="${st.plan[w]===id}">${t.e} ${t.n}</button>`).join("")}</div></div>`).join("");
+  return `<h1>Тренировки</h1>
+  <h2>Эта неделя</h2><div class="week">${week}</div>
+  <h2>Всего</h2><div class="counts">
+    <div><b>${s.by.leg}</b>🦵 leg</div><div><b>${s.by.arm}</b>💪 arm</div><div><b>${s.by.cardio}</b>🏃‍♀️ кардио</div></div>
+  <h2>Мой план на неделю</h2><p class="small muted" style="margin:-4px 0 12px">Выбери тип для каждого дня. В дни отдыха тренировка не нужна для стрика.</p>
+  <div class="plan">${rows}</div>`;
+}
+function trophyRow(t,s){
+  const [v,goal]=t.p(s),got=!!(st.unlocked||{})[t.id],pr=(st.prizes||{})[t.id]||"";
+  const pct=Math.min(100,Math.round(v/goal*100));
+  return `<div class="troph ${got?"":"locked"}" style="--tc:${TIERS[t.t].c}">
+    <div class="medal" aria-hidden="true">${t.e}</div>
+    <div class="grow"><h3>${esc(t.n)}</h3><p class="small muted">${esc(t.d)}${got?", получен":`, ${Math.min(v,goal)}/${goal}${t.id.startsWith("q")?"%":""}`}</p>
+      ${got?"":`<div class="bar"><i style="width:${pct}%"></i></div>`}
+      <div class="prize">${got&&pr?`<span class="got">🎁 ${esc(pr)}</span>`:`<input data-prize="${t.id}" placeholder="🎁 Приз за этот трофей" value="${esc(pr)}" aria-label="Приз за трофей ${esc(t.n)}">`}</div>
+    </div></div>`;
+}
+function viewTrophies(){
+  const s=stats(),got=Object.keys(st.unlocked||{}).length,plat=TROPHIES.find(t=>t.t==="plat");
+  const platGot=!!(st.unlocked||{}).plat,pr=(st.prizes||{}).plat||"";
+  let html=`<h1>Трофеи</h1>
+  <div class="summary"><div><b>${got}/${TROPHIES.length}</b><span class="small muted">получено</span></div><div><b>🔥${s.best}</b><span class="small muted">лучший стрик</span></div><div><b>${s.full}</b><span class="small muted">идеальных дней</span></div></div>
+  <div class="platcard"><div style="display:flex;gap:16px;align-items:center">
+    <div class="medal" style="--tc:var(--plat);${platGot?"":"filter:grayscale(.6);opacity:.7"}">${plat.e}</div>
+    <div><h3 style="font-family:var(--display);font-size:1.15rem">Платина</h3><p class="small">${platGot?"Цель достигнута! 🎉":"Доберись до цели: "+fmt(st.goal)+" кг. Сейчас "+s.pct+"%"}</p></div></div>
+    <div class="prize" style="margin-top:14px">${platGot&&pr?`<span class="got" style="color:#1C1A2B">🎁 ${esc(pr)}</span>`:`<input data-prize="plat" placeholder="🎁 Главный приз, например заказ с ASOS" value="${esc(pr)}" aria-label="Главный приз">`}</div>
+  </div>`;
+  for(const tier of ["gold","silver","bronze"]){
+    html+=`<div class="tier"><span class="dot" style="background:${TIERS[tier].c}"></span><h2>${TIERS[tier].n}</h2></div>`;
+    html+=TROPHIES.filter(t=>t.t===tier).map(t=>trophyRow(t,s)).join("");
+  }
+  return html;
+}
+function viewTogether(){
+  if(!st.group)return `<h1>Вместе</h1>
+    <p class="muted" style="margin:6px 0 18px">Создай группу и отправь код маме. Вы увидите стрики, трофеи и процент к цели друг друга. Килограммы и фото остаются личными.</p>
+    <button class="btn block" data-act="newgroup">Создать группу</button>
+    <h2>Или вступи по коду</h2>
+    <div class="grouprow"><input id="g-code" maxlength="12" placeholder="Код группы" aria-label="Код группы"><button class="btn" data-act="join">Вступить</button></div>`;
+  const tk=todayKey();
+  const list=[...board].sort((a,b)=>(b.streak||0)-(a.streak||0));
+  const people=list.map(p=>{const me=p.id===uid,today=p.day===tk;
+    return `<div class="person"><div class="hd"><h3>${esc(p.nick||"Без имени")}${me?'<span class="you">ты</span>':""}</h3>
+      <div class="stats"><span>🔥${p.streak||0}</span><span>🏆${p.trophies||0}</span></div></div>
+      <div class="prow" style="margin-bottom:6px"><span class="small muted">Путь к цели</span><b style="font-size:1rem">${p.pct||0}%</b></div>
+      <div class="bar"><i style="width:${p.pct||0}%"></i></div>
+      <div class="today">${today?`<span>${p.w?"✅":"⬜"} вес</span><span>${p.m||0}/3 еда</span><span>${p.rest?"😴 отдых":p.wo?"✅ тренировка":"⬜ тренировка"}</span>`:"<span>Сегодня ещё не заходила</span>"}</div>
+    </div>`}).join("");
+  return `<h1>Вместе</h1>
+  <p class="muted" style="margin:6px 0 4px">Код группы</p>
+  <div style="display:flex;align-items:center;gap:12px;margin-bottom:18px"><span class="code">${esc(st.group)}</span><button class="btn ghost" data-act="copycode">Скопировать</button></div>
+  ${people||`<p class="notice">Загружаем…</p>`}
+  ${list.length<2?`<p class="notice">Отправь маме код. Она установит приложение, создаст свой аккаунт и введёт код во вкладке «Вместе».</p>`:""}
+  <button class="linkbtn" style="margin-top:16px" data-act="leave">Выйти из группы</button>`;
+}
+function goalForm(isNew){
+  const dl=st.deadline||addDays(todayKey(),30);
+  return `
+  <label for="f-nick">Как тебя называть</label><input id="f-nick" maxlength="30" value="${esc(st.nick)}" placeholder="Катя">
+  <div class="row2">
+    <div><label for="f-start">${isNew?"Вес сейчас, кг":"Стартовый вес, кг"}</label><input id="f-start" inputmode="decimal" value="${st.start!=null?fmt(st.start):""}" placeholder="70"></div>
+    <div><label for="f-goal">Цель, кг</label><input id="f-goal" inputmode="decimal" value="${st.goal!=null?fmt(st.goal):""}" placeholder="65"></div>
+  </div>
+  <label for="f-dl">К какой дате</label><input id="f-dl" type="date" value="${dl}" min="${addDays(todayKey(),1)}">
+  <p class="small muted" id="pace" style="margin-top:10px">${esc(paceText(st.start,st.goal,dl))}</p>
+  <button class="btn block" style="margin-top:18px" data-act="savegoal">${isNew?"Начать":"Сохранить цель"}</button>`;
+}
+function viewGoal(){
+  const hours=[6,7,8,9,10,11,12].map(h=>`<option value="${h}" ${st.remind.weigh===h?"selected":""}>${pad(h)}:00</option>`).join("");
+  return `<h1>Моя цель</h1>${goalForm(false)}
+  <h2>Напоминания</h2>
+  <p class="small muted">${esc(notifStatus())}</p>
+  <label for="r-hour">Напомнить взвеситься, если не сделала к</label><select id="r-hour">${hours}</select>
+  <label class="check"><input type="checkbox" id="r-meals" ${st.remind.meals?"checked":""}> Напоминать про пропущенную еду и стрик</label>
+  ${window.Notification?.permission==="granted"&&st.remind.on
+    ?`<button class="btn ghost" style="margin-top:14px" data-act="notifoff">Выключить уведомления</button>`
+    :`<button class="btn block" style="margin-top:14px" data-act="notif">Включить уведомления 🔔</button>`}
+  <h2>Начать заново</h2><p class="small muted" style="margin-bottom:10px">Сотрёт записи, стрик и трофеи. Призы и план тренировок останутся.</p>
+  <button class="btn ghost" data-act="reset">Сбросить прогресс</button>
+  <h2>Аккаунт</h2><p class="small muted" style="margin-bottom:10px">${esc(auth.currentUser?.email||"")}</p>
+  <button class="btn ghost" data-act="logout">Выйти</button>`;
+}
+function viewOnboard(){
+  return `<h1 style="font-size:1.9rem;margin-top:12px">Мой стрик 🔥</h1>
+  <p class="muted" style="margin:8px 0 6px">Взвешивайся по утрам, отмечай еду и тренировки, собирай трофеи и забирай призы. Цель ставишь сама.</p>
+  ${goalForm(true)}`;
+}
+function viewLogin(){
+  const signup=authMode==="signup";
+  return `<h1 style="font-size:1.9rem;margin-top:24px">Мой стрик 🔥</h1>
+  <p class="muted" style="margin:8px 0 6px">${signup?"Создай аккаунт, чтобы данные хранились в облаке и были на любом устройстве.":"Войди, чтобы продолжить свой стрик."}</p>
+  <div class="login">
+    <label for="l-email">Почта</label><input id="l-email" type="email" autocomplete="email">
+    <label for="l-pass">Пароль</label><input id="l-pass" type="password" autocomplete="${signup?"new-password":"current-password"}" placeholder="${signup?"Минимум 6 символов":""}">
+    <button class="btn block" style="margin-top:18px" data-act="${signup?"signup":"login"}">${signup?"Создать аккаунт":"Войти"}</button>
+    <div class="links">
+      <button class="linkbtn" data-act="mode">${signup?"У меня уже есть аккаунт":"Создать аккаунт"}</button>
+      ${signup?"":`<button class="linkbtn" data-act="forgot">Забыла пароль</button>`}
+    </div>
+  </div>`;
+}
+
+/* ---------- render ---------- */
+const NAV=[["today","📅","Сегодня"],["gym","🏋️‍♀️","Зал"],["trophies","🏆","Трофеи"],["together","👯‍♀️","Вместе"],["goal","🎯","Цель"]];
+function render(){
+  const app=$("#app"),nav=$("#nav");
+  if(!uid){app.innerHTML=viewLogin();nav.classList.add("hidden");return}
+  if(!st)return;
+  if(st.goal==null){app.innerHTML=viewOnboard();nav.classList.add("hidden");return}
+  nav.classList.remove("hidden");
+  nav.querySelector(".in").innerHTML=NAV.map(([id,e,n])=>`<button class="${tab===id?"on":""}" data-tab="${id}" aria-current="${tab===id?"page":"false"}"><span aria-hidden="true">${e}</span>${n}</button>`).join("");
+  const v={today:viewToday,gym:viewGym,trophies:viewTrophies,together:viewTogether,goal:viewGoal}[tab];
+  app.innerHTML=v();
+}
+
+/* ---------- auth ---------- */
+const AUTH_ERR={"auth/invalid-credential":"Неверная почта или пароль","auth/wrong-password":"Неверная почта или пароль","auth/user-not-found":"Неверная почта или пароль",
+  "auth/email-already-in-use":"Такой аккаунт уже есть, просто войди","auth/weak-password":"Пароль минимум 6 символов","auth/invalid-email":"Проверь адрес почты",
+  "auth/too-many-requests":"Слишком много попыток, подожди немного","auth/network-request-failed":"Нет интернета"};
+const authErr=e=>toastText(AUTH_ERR[e.code]||"Ошибка входа",e.code||"");
+function creds(){return [$("#l-email").value.trim(),$("#l-pass").value]}
+
+onAuthStateChanged(auth,async u=>{
+  if(unsubGroup){unsubGroup();unsubGroup=null}
+  if(!u){uid=null;st=null;photos={};board=[];render();return}
+  uid=u.uid;$("#app").innerHTML=`<p class="muted">Загрузка…</p>`;
+  let loaded=null;
+  try{const s=await getDoc(doc(fs,"users",uid));loaded=s.exists()?s.data():null}catch(e){console.warn(e)}
+  st=Object.assign({v:1,nick:"",start:null,goal:null,deadline:null,startDate:null,plan:{...DEF_PLAN},prizes:{},log:{},unlocked:{},group:null},loaded||{});
+  st.remind=Object.assign({weigh:9,meals:true,on:false},st.remind||{});
+  const tz=Intl.DateTimeFormat().resolvedOptions().timeZone;
+  if(st.tz!==tz){st.tz=tz;if(loaded)save()}
+  try{const p=await getDoc(doc(fs,"users",uid,"photos",todayKey()));photos[todayKey()]=p.exists()?p.data():{}}catch(e){}
+  if(st.goal!=null)checkTrophies(true);
+  tab="today";render();
+  if(st.group){subscribeGroup();pushBoard(true)}
+  if(st.remind.on&&"Notification" in window&&Notification.permission==="granted")registerToken().catch(console.warn);
+});
+
+/* ---------- events ---------- */
+document.addEventListener("click",async e=>{
+  const tb=e.target.closest("[data-tab]");if(tb){tab=tb.dataset.tab;render();window.scrollTo(0,0);return}
+  const a=e.target.closest("[data-act]");if(!a)return;
+  const act=a.dataset.act,k=todayKey();
+  if(act==="login"){const [em,pw]=creds();signInWithEmailAndPassword(auth,em,pw).catch(authErr)}
+  else if(act==="signup"){const [em,pw]=creds();createUserWithEmailAndPassword(auth,em,pw).catch(authErr)}
+  else if(act==="mode"){authMode=authMode==="login"?"signup":"login";render()}
+  else if(act==="forgot"){const em=$("#l-email").value.trim();if(!em){toastText("Впиши почту","И нажми ещё раз");return}
+    sendPasswordResetEmail(auth,em).then(()=>toastText("Письмо отправлено","Проверь почту, включая спам")).catch(authErr)}
+  else if(act==="logout"){await signOut(auth)}
+  else if(act==="weigh"){
+    const w=num($("#w").value);if(w==null||w<20||w>400){toastText("Проверь вес","Введи число в килограммах");return}
+    day(k).w=w;checkTrophies();save();render();
+  }else if(act==="meal"){
+    const d=day(k),m=a.dataset.m;d[m]=!d[m];checkTrophies();save();render();
+  }else if(act==="photo"){
+    pendingMeal=a.dataset.m;$("#photo").click();
+  }else if(act==="wo"){
+    const d=day(k);if(d.wo)delete d.wo;else d.wo=planFor(k);checkTrophies();save();render();
+  }else if(act==="plan"){
+    st.plan[a.dataset.d]=a.dataset.t;save();render();
+  }else if(act==="savegoal"){
+    const nick=$("#f-nick").value.trim(),start=num($("#f-start").value),goal=num($("#f-goal").value),dl=$("#f-dl").value;
+    if(!nick||start==null||goal==null||!dl){toastText("Заполни все поля","Имя, вес, цель и дата");return}
+    if(start===goal){toastText("Цель совпадает с весом","Поставь другую цифру");return}
+    const isNew=st.goal==null;
+    Object.assign(st,{nick,start,goal,deadline:dl});
+    if(isNew){st.startDate=k;day(k).w=start}
+    checkTrophies(isNew);save();
+    if(isNew){tab="today";render();toastText("Поехали! 🔥","Первый трофей уже твой")}
+    else{render();toastText("Цель сохранена","")}
+  }else if(act==="reset"){
+    if(!confirm("Точно сбросить весь прогресс?"))return;
+    st.log={};st.unlocked={};st.startDate=k;photos={};save();render();
+  }else if(act==="newgroup"){joinGroup(newCode())}
+  else if(act==="join"){joinGroup($("#g-code").value)}
+  else if(act==="leave"){if(confirm("Выйти из группы?"))leaveGroup()}
+  else if(act==="copycode"){navigator.clipboard?.writeText(st.group).then(()=>toastText("Код скопирован",st.group)).catch(()=>{})}
+  else if(act==="notif"){enableNotifications()}
+  else if(act==="notifoff"){st.remind.on=false;save();render();toastText("Уведомления выключены","")}
+});
+document.addEventListener("change",e=>{
+  const p=e.target.dataset&&e.target.dataset.prize;
+  if(p){st.prizes=st.prizes||{};const v=e.target.value.trim().slice(0,80);if(v)st.prizes[p]=v;else delete st.prizes[p];save();return}
+  if(e.target.id==="r-hour"){st.remind.weigh=Number(e.target.value);save()}
+  if(e.target.id==="r-meals"){st.remind.meals=e.target.checked;save()}
+});
+document.addEventListener("input",e=>{
+  if(["f-start","f-goal","f-dl"].includes(e.target.id)){
+    const el=$("#pace");if(el)el.textContent=paceText(num($("#f-start").value),num($("#f-goal").value),$("#f-dl").value);
+  }
+});
+document.addEventListener("keydown",e=>{
+  if(e.key!=="Enter")return;
+  if(e.target.id==="w")$('[data-act="weigh"]').click();
+  if(e.target.id==="l-pass")$('[data-act="login"],[data-act="signup"]').click();
+});
+document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible"&&st&&st.goal!=null&&!document.activeElement.matches("input"))render()});

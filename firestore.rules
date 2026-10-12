@@ -1,0 +1,23 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Личные данные: вес, еда, фото, цель. Видит только сам пользователь.
+    match /users/{uid} {
+      allow read, write: if request.auth != null && request.auth.uid == uid;
+      match /photos/{day} {
+        allow read, write: if request.auth != null && request.auth.uid == uid;
+      }
+    }
+    // Токены для push-уведомлений
+    match /tokens/{uid} {
+      allow read, write: if request.auth != null && request.auth.uid == uid;
+    }
+    // Общий прогресс: видят только участники группы (кто знает код)
+    match /groups/{g}/members/{uid} {
+      allow read: if request.auth != null
+        && exists(/databases/$(database)/documents/groups/$(g)/members/$(request.auth.uid));
+      allow write: if request.auth != null && request.auth.uid == uid;
+    }
+    // reminders/* пишет только скрипт напоминаний (через admin), клиентам доступа нет
+  }
+}
