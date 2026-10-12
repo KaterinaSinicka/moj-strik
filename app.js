@@ -9,7 +9,19 @@ const fbApp = initializeApp(self.FIREBASE_CONFIG);
 const auth = getAuth(fbApp);
 const fs = initializeFirestore(fbApp, { localCache: persistentLocalCache({ tabManager: persistentMultipleTabManager() }) });
 let swReg = null, messaging = null;
-if ("serviceWorker" in navigator) navigator.serviceWorker.register("./sw.js").then(r => swReg = r).catch(console.warn);
+if ("serviceWorker" in navigator) {
+  const hadController = !!navigator.serviceWorker.controller;
+  let reloaded = false;
+  navigator.serviceWorker.register("./sw.js").then(r => swReg = r).catch(console.warn);
+  // новая версия приложения установилась → один раз перезагружаемся
+  navigator.serviceWorker.addEventListener("controllerchange", () => {
+    if (!hadController || reloaded) return;
+    reloaded = true;
+    location.reload();
+  });
+  // при каждом возвращении в приложение проверяем, нет ли обновления
+  document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") swReg?.update().catch(() => {}); });
+}
 
 /* ---------- constants ---------- */
 const CATALOG=[
@@ -60,7 +72,7 @@ const clone=o=>JSON.parse(JSON.stringify(o));
 const nowHM=()=>{const d=new Date();return pad(d.getHours())+":"+pad(d.getMinutes())};
 
 /* ---------- state ---------- */
-let picker=false, showCatalog=false;
+let picker=false, showCatalog=false, freezeFor=null, freezeReason=null;
 let uid=null, st=null, photos={}, board=[], tab="today", pendingMeal=null, unsubGroup=null, authMode="login";
 
 const chains={};
@@ -98,11 +110,17 @@ function pctGoal(){
   const p=(st.start-currentWeight())/span*100;
   return Math.max(0,Math.min(100,Math.round(p)));
 }
+const isFrozen=k=>!!(st.log[k]&&st.log[k].frz);
+function streakAt(k){let n=0;while(isFull(k)||isFrozen(k)){if(isFull(k))n++;k=addDays(k,-1)}return n}
 function streakNow(){
-  let k=todayKey();if(!isFull(k))k=addDays(k,-1);
-  let n=0;while(isFull(k)){n++;k=addDays(k,-1)}
-  return n;
+  let k=todayKey();if(!isFull(k)&&!isFrozen(k))k=addDays(k,-1);
+  return streakAt(k);
 }
+const weekStart=k=>addDays(k,-((parseKey(k).getDay()+6)%7));
+function freezeUsedInWeek(k){const ws=weekStart(k);for(let i=0;i<7;i++){const x=addDays(ws,i);if(x!==k&&isFrozen(x))return x}return null}
+const canFreeze=k=>!isFull(k)&&!isFrozen(k)&&!freezeUsedInWeek(k);
+const REASONS=[["sick","🤒","Болею"],["trip","✈️","В поездке"],["work","💼","Много работы"],["party","🎉","Праздник"],["tired","🌧️","Нет сил"],["other","✍️","Другое"]];
+const reasonLabel=r=>{const x=REASONS.find(z=>z[0]===r);return x?x[1]+" "+x[2]:"❄️"};
 function stats(){
   const ks=Object.keys(st.log).sort();
   const s={weighIns:0,photos:0,full:0,wo:0,by:{},best:0,pct:pctGoal(),kinds:0,fav:0,early:0,late:0};
@@ -116,7 +134,7 @@ function stats(){
   s.kinds=Object.keys(s.by).length;s.fav=Math.max(0,...Object.values(s.by));
   if(ks.length){
     let k=ks[0],run=0;const end=todayKey();
-    while(k<=end){if(isFull(k)){run++;s.best=Math.max(s.best,run)}else run=0;k=addDays(k,1)}
+    while(k<=end){if(isFull(k)){run++;s.best=Math.max(s.best,run)}else if(!isFrozen(k))run=0;k=addDays(k,1)}
   }
   return s;
 }
@@ -141,7 +159,8 @@ let lastBoard="";
 function boardBody(){
   const k=todayKey(),d=st.log[k]||{};
   return {nick:st.nick.slice(0,30),pct:pctGoal(),streak:streakNow(),trophies:unlockedCount(),
-    day:k,w:d.w!=null,m:["b","l","d"].filter(m=>d[m]).length,wo:!!d.wo,rest:planFor(k)==="rest"};
+    day:k,w:d.w!=null,m:["b","l","d"].filter(m=>d[m]).length,wo:!!d.wo,rest:planFor(k)==="rest",frz:d.frz?d.frz.r:null,
+    sent:Object.fromEntries(Object.entries(st.sent||{}).filter(([,v])=>v.day===k))};
 }
 function pushBoard(force){
   if(!uid||!st||!st.nick||!st.group)return Promise.resolve();
@@ -155,8 +174,19 @@ function subscribeGroup(){
   board=[];if(!st.group)return;
   unsubGroup=onSnapshot(collection(fs,"groups",st.group,"members"),snap=>{
     board=snap.docs.map(d=>({id:d.id,...d.data()}));
+    notifyReactions();
     if(tab==="together")render();
   },e=>console.warn("group",e));
+}
+const REACTS=["🔥","👏","💪","❤️"];
+function received(pid){const tk=todayKey();return board.filter(o=>o.id!==pid&&o.sent&&o.sent[pid]&&o.sent[pid].day===tk).map(o=>({id:o.id,e:o.sent[pid].e,nick:o.nick||"Кто-то"}))}
+function notifyReactions(){
+  let seen=[];try{seen=JSON.parse(localStorage.getItem("ms-seen-react")||"[]")}catch(e){}
+  const tk=todayKey(),fresh=received(uid).filter(r=>!seen.includes(r.id+":"+r.e+":"+tk));
+  if(!fresh.length)return;
+  toastText(fresh.map(r=>r.e).join(" ")+" для тебя!",fresh.map(r=>r.nick).join(", ")+" поддерживает тебя");
+  seen=[...seen.filter(x=>x.endsWith(tk)),...fresh.map(r=>r.id+":"+r.e+":"+tk)];
+  try{localStorage.setItem("ms-seen-react",JSON.stringify(seen))}catch(e){}
 }
 function newCode(){
   const a="ABCDEFGHJKLMNPQRSTUVWXYZ23456789";let s="";
@@ -253,9 +283,72 @@ function toastTrophy(t){
 }
 function toastText(a,b){showToast(`<div class="tin"><div><b>${esc(a)}</b><small>${esc(b)}</small></div></div>`)}
 
+/* ---------- week summary ---------- */
+function weekSummary(ws){
+  const end=todayKey(),days=[];for(let i=0;i<7;i++){const k=addDays(ws,i);if(k<=end)days.push(k)}
+  const r={ws,days:days.length,full:0,wo:0,by:{},meals:0,weigh:0,frz:[],tro:[],delta:null};
+  for(const k of days){const d=st.log[k]||{};
+    if(isFull(k))r.full++;if(d.frz)r.frz.push(d.frz.r);
+    if(d.wo&&d.wo!=="rest"){r.wo++;r.by[d.wo]=(r.by[d.wo]||0)+1}
+    r.meals+=["b","l","d"].filter(m=>d[m]).length;if(d.w!=null)r.weigh++;}
+  const wk=Object.keys(st.log).filter(k=>st.log[k].w!=null).sort();
+  const inW=wk.filter(k=>k>=ws&&k<=addDays(ws,6)),before=wk.filter(k=>k<ws);
+  if(inW.length){const last=st.log[inW[inW.length-1]].w,base=before.length?st.log[before[before.length-1]].w:st.log[inW[0]].w;if(inW.length>1||before.length)r.delta=last-base}
+  r.tro=TROPHIES.filter(t=>{const u=(st.unlocked||{})[t.id];return u&&u>=ws&&u<=addDays(ws,6)});
+  return r;
+}
+function summaryHTML(r,title,dismiss){
+  const range=parseKey(r.ws).toLocaleDateString("ru-RU",{day:"numeric",month:"short"})+" – "+parseKey(addDays(r.ws,6)).toLocaleDateString("ru-RU",{day:"numeric",month:"short"});
+  const verdict=r.full>=6?"Легенда недели 👑":r.full>=4?"Отличная неделя 💪":r.full>=2?"Неплохо, на следующей будет ещё лучше 🙌":"Новая неделя, новый старт ✨";
+  const top=Object.entries(r.by).sort((a,b)=>b[1]-a[1]).slice(0,3).map(([id,n])=>act(id).e+" "+esc(act(id).n)+" ×"+n).join(", ");
+  const dl=r.delta==null?"":Math.abs(r.delta)<0.05?"0":(r.delta<0?"−"+fmt(-r.delta):"+"+fmt(r.delta));
+  return `<div class="sumcard"><div class="sumhd"><h3>${title}</h3><span class="small muted">${range}</span></div>
+    <p class="sumverdict">${verdict}</p>
+    <div class="sumgrid"><div><b>${r.full}/7</b><span class="small muted">идеальных дней</span></div><div><b>${r.wo}</b><span class="small muted">тренировок</span></div>
+      <div><b>${r.meals}/${r.days*3}</b><span class="small muted">приёмов пищи</span></div><div><b>${dl||r.weigh+"/"+r.days}</b><span class="small muted">${dl?"кг за неделю":"взвешиваний"}</span></div></div>
+    ${top?`<p class="small">Чаще всего: ${top}</p>`:""}
+    ${r.tro.length?`<p class="small" style="margin-top:6px">Новые трофеи: ${r.tro.map(t=>t.e+" "+esc(t.n)).join(", ")}</p>`:""}
+    ${r.frz.length?`<p class="small" style="margin-top:6px">Заморозка: ${r.frz.map(reasonLabel).join(", ")}</p>`:""}
+    ${dismiss?`<button class="linkbtn" style="margin-top:8px" data-act="sumhide" data-ws="${r.ws}">Скрыть</button>`:""}
+  </div>`;
+}
+function freezePanel(k){
+  const label=k===todayKey()?"сегодня":"вчера";
+  return `<div class="freeze">
+    <h3>❄️ Заморозить ${label}</h3>
+    <p class="small" style="margin-top:4px">Одна заморозка в неделю. Стрик не прервётся, но и не вырастет за этот день. Напоминаний в этот день не будет.</p>
+    <p class="small" style="font-weight:700;margin-top:12px">Почему?</p>
+    <div class="chips" style="margin-top:6px">${REASONS.map(([id,e,n])=>`<button class="chip ${freezeReason===id?"on":""}" data-act="frzreason" data-r="${id}" aria-pressed="${freezeReason===id}">${e} ${n}</button>`).join("")}</div>
+    <input id="frz-note" maxlength="80" placeholder="Комментарий, если хочешь" style="margin-top:10px" aria-label="Комментарий">
+    <div style="display:flex;gap:8px;margin-top:12px"><button class="btn" data-act="frzdo" ${freezeReason?"":"disabled"}>Заморозить</button><button class="btn ghost" data-act="frzcancel">Отмена</button></div>
+  </div>`;
+}
+function freezeBlock(){
+  const k=todayKey(),y=addDays(k,-1),d=st.log[k]||{};
+  if(freezeFor)return freezePanel(freezeFor);
+  if(d.frz)return `<div class="freeze"><h3>❄️ День заморожен</h3><p class="small" style="margin-top:4px">${reasonLabel(d.frz.r)}${d.frz.note?": "+esc(d.frz.note):""}. Стрик в безопасности, отдыхай.</p>
+    <button class="linkbtn" style="margin-top:6px" data-act="unfreeze" data-k="${k}">Разморозить</button></div>`;
+  const yLost=!isFull(y)&&!isFrozen(y)&&streakAt(addDays(y,-1))>0&&!isFull(k);
+  if(yLost&&canFreeze(y))return `<div class="freeze"><h3>Вчера стрик 🔥${streakAt(addDays(y,-1))} прервался</h3><p class="small" style="margin-top:4px">Если была причина, его можно спасти заморозкой.</p>
+    <button class="btn" style="margin-top:10px" data-act="frzopen" data-k="${y}">❄️ Заморозить вчера</button></div>`;
+  if(!isFull(k)&&canFreeze(k))return `<button class="linkbtn" style="margin-top:12px" data-act="frzopen" data-k="${k}">❄️ Заморозить сегодня</button>`;
+  if(!isFull(k)&&!isFrozen(k)){const u=freezeUsedInWeek(k);if(u)return `<p class="small muted" style="margin-top:12px">❄️ Заморозка на этой неделе уже использована.</p>`}
+  return "";
+}
+function summaryToday(){
+  const k=todayKey(),dow=parseKey(k).getDay(),h=new Date().getHours();
+  let ws=null,title="";
+  if(dow===0&&h>=18){ws=weekStart(k);title="Итоги этой недели"}
+  else if(dow===1){ws=weekStart(addDays(k,-1));title="Итоги прошлой недели"}
+  if(!ws||st.sumHidden===ws)return "";
+  const r=weekSummary(ws);if(!Object.keys(st.log).some(x=>x>=ws&&x<=addDays(ws,6)))return "";
+  return summaryHTML(r,title,true);
+}
+
 /* ---------- views ---------- */
 function nudges(){
   const h=new Date().getHours(),k=todayKey(),d=st.log[k]||{},out=[];
+  if(d.frz)return out;
   if(d.w==null&&h>=10)out.push("Весы скучают ⚖️ Ты ещё не взвесилась сегодня.");
   for(const m of MEALS)if(!d[m.k]&&h>=m.h)out.push(m.msg);
   if(h>=20&&!isFull(k)){const s=streakNow();if(s>0)out.push(`До полуночи закрой день, иначе стрик 🔥${s} сгорит.`)}
@@ -292,6 +385,8 @@ function viewToday(){
     <div class="flame ${s?"":"cold"}"><b>🔥${s}</b><span>${s===1?"день":"дней"} подряд</span></div>
   </div>
   ${nd.length?`<div class="nudges">${nd.map(t=>`<div class="nudge">${esc(t)}</div>`).join("")}</div>`:""}
+  ${freezeBlock()}
+  ${summaryToday()}
   <div class="weigh">
     <div class="grow">${d.w!=null
       ?`<div class="num">${fmt(d.w)}<small>кг</small></div><p class="small muted">${diff<=0?"−"+fmt(-diff):"+"+fmt(diff)} кг от старта</p>`
@@ -327,7 +422,7 @@ function viewGym(){
   const tk=todayKey(),tdow=parseKey(tk).getDay(),s=stats(),mine=st.activities;
   const start=addDays(tk,-((tdow+6)%7));
   const week=[0,1,2,3,4,5,6].map(i=>{const k=addDays(start,i),p=planFor(k),d=st.log[k]||{};
-    const mark=d.wo?"✅":p==="rest"?"😴":k<tk?"✖️":act(p).e;
+    const mark=d.frz?"❄️":d.wo?"✅":p==="rest"?"😴":k<tk?"✖️":act(p).e;
     const tm=d.wot||(p!=="rest"?st.planTime[parseKey(k).getDay()]:"")||"";return `<div><span class="muted">${DOW[parseKey(k).getDay()]}</span><b>${mark}</b><small class="muted">${esc(tm)}</small></div>`}).join("");
   const opts=[...mine,"rest"];
   const rows=WEEK_ORDER.map(w=>`<div class="prow2 ${w===tdow?"today":""}"><span class="dn">${DOW[w]}</span>${st.plan[w]==="rest"?`<span class="small muted">отдых</span>`:`<input type="time" class="ptime" data-ptime="${w}" value="${esc(st.planTime[w]||"")}" aria-label="Время тренировки, ${DOW[w]}">`}<div class="chips">${
@@ -343,7 +438,8 @@ function viewGym(){
   ${showCatalog?catalogHTML():""}
   <h2>Мой план на неделю</h2><p class="small muted" style="margin:-4px 0 12px">Выбери активность и время для каждого дня. В дни отдыха тренировка не нужна для стрика.</p>
   <div class="plan">${rows}</div>
-  ${counts?`<h2>Всего тренировок</h2><div class="counts">${counts}</div>`:""}`;
+  ${counts?`<h2>Всего тренировок</h2><div class="counts">${counts}</div>`:""}
+  ${(()=>{const ws=weekStart(addDays(start,-1));return Object.keys(st.log).some(x=>x>=ws&&x<start)?summaryHTML(weekSummary(ws),"Итоги прошлой недели",false):""})()}`;
 }
 function trophyRow(t,s){
   const [v,goal]=t.p(s),got=!!(st.unlocked||{})[t.id],pr=(st.prizes||{})[t.id]||"";
@@ -384,7 +480,9 @@ function viewTogether(){
       <div class="stats"><span>🔥${p.streak||0}</span><span>🏆${p.trophies||0}</span></div></div>
       <div class="prow" style="margin-bottom:6px"><span class="small muted">Путь к цели</span><b style="font-size:1rem">${p.pct||0}%</b></div>
       <div class="bar"><i style="width:${p.pct||0}%"></i></div>
-      <div class="today">${today?`<span>${p.w?"✅":"⬜"} вес</span><span>${p.m||0}/3 еда</span><span>${p.rest?"😴 отдых":p.wo?"✅ тренировка":"⬜ тренировка"}</span>`:"<span>Сегодня ещё не заходила</span>"}</div>
+      <div class="today">${today&&p.frz?`<span>❄️ День заморожен: ${esc(reasonLabel(p.frz))}</span>`:today?`<span>${p.w?"✅":"⬜"} вес</span><span>${p.m||0}/3 еда</span><span>${p.rest?"😴 отдых":p.wo?"✅ тренировка":"⬜ тренировка"}</span>`:"<span>Сегодня ещё не заходила</span>"}</div>
+      ${(()=>{const rec=received(p.id);return rec.length?`<p class="recv">${rec.map(r=>`${r.e} ${esc(r.nick)}`).join(", ")}</p>`:""})()}
+      ${me?"":`<div class="reacts">${REACTS.map(e=>{const on=(st.sent||{})[p.id]&&st.sent[p.id].day===tk&&st.sent[p.id].e===e;return `<button class="rbtn ${on?"on":""}" data-act="react" data-to="${esc(p.id)}" data-e="${e}" aria-pressed="${on}" aria-label="Реакция ${e} для ${esc(p.nick||"")}">${e}</button>`}).join("")}</div>`}
     </div>`}).join("");
   return `<h1>Вместе</h1>
   <p class="muted" style="margin:6px 0 4px">Код группы</p>
@@ -503,6 +601,22 @@ document.addEventListener("click",async e=>{
     pendingMeal=a.dataset.m;$("#photo").click();
   }else if(action==="wo"){
     const d=day(k);if(d.wo){delete d.wo;delete d.wot}else{d.wo=planFor(k);d.wot=nowHM()}checkTrophies();save();render();
+  }else if(action==="frzopen"){freezeFor=a.dataset.k;freezeReason=null;render();
+  }else if(action==="frzreason"){const note=$("#frz-note")?.value||"";freezeReason=a.dataset.r;render();const n=$("#frz-note");if(n)n.value=note;
+  }else if(action==="frzcancel"){freezeFor=null;freezeReason=null;render();
+  }else if(action==="frzdo"){
+    if(!freezeFor||!freezeReason)return;
+    if(!canFreeze(freezeFor)){toastText("Не получится","Заморозка на этой неделе уже использована");freezeFor=null;render();return}
+    const note=($("#frz-note")?.value||"").trim().slice(0,80);
+    day(freezeFor).frz=note?{r:freezeReason,note}:{r:freezeReason};
+    freezeFor=null;freezeReason=null;save();render();toastText("День заморожен ❄️","Стрик в безопасности");
+  }else if(action==="unfreeze"){delete day(a.dataset.k).frz;save();render();
+  }else if(action==="sumhide"){st.sumHidden=a.dataset.ws;save();render();
+  }else if(action==="react"){
+    st.sent=st.sent||{};const to=a.dataset.to,e=a.dataset.e,cur=st.sent[to];
+    if(cur&&cur.day===k&&cur.e===e)delete st.sent[to];else st.sent[to]={day:k,e};
+    for(const [id,v] of Object.entries(st.sent))if(v.day!==k)delete st.sent[id];
+    save();pushBoard();render();
   }else if(action==="picker"){picker=!picker;render();
   }else if(action==="wopick"){
     day(k).wo=a.dataset.a;day(k).wot=nowHM();picker=false;checkTrophies();save();render();
