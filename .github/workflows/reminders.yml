@@ -1,0 +1,21 @@
+name: Reminders
+on:
+  schedule:
+    - cron: "7 * * * *"   # каждый час в :07 (UTC, скрипт сам переводит в местное время)
+  workflow_dispatch:       # кнопка «Run workflow» для ручной проверки
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: reminders
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm install
+      - run: node send.mjs
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          APP_URL: ${{ vars.APP_URL }}
