@@ -45,6 +45,8 @@ const TROPHIES=[
  {id:"photo10",t:"bronze",e:"📸",n:"Фуд-блогер",d:"10 фото еды",p:s=>[s.photos,10]},
  {id:"lark",t:"bronze",e:"🐦",n:"Ой, ты жаворонок",d:"Тренировка до 10:00",p:s=>[s.early,1]},
  {id:"owl",t:"bronze",e:"🦉",n:"А я думала, сова",d:"Тренировка после 21:00",p:s=>[s.late,1]},
+ {id:"hour1",t:"bronze",e:"⏱️",n:"Первый час",d:"60 минут тренировок в сумме",p:s=>[s.min,60]},
+ {id:"here5",t:"bronze",e:"📍",n:"Я тут была",d:"5 фото с тренировок",p:s=>[s.wphotos,5]},
  {id:"wo5",t:"bronze",e:"🏋️‍♀️",n:"Втянулась",d:"5 тренировок",p:s=>[s.wo,5]},
  {id:"s7",t:"silver",e:"🔥",n:"Неделя огня",d:"Стрик 7 дней",p:s=>[s.best,7]},
  {id:"wo20",t:"silver",e:"💪",n:"В ритме",d:"20 тренировок",p:s=>[s.wo,20]},
@@ -52,6 +54,9 @@ const TROPHIES=[
  {id:"fav10",t:"silver",e:"⭐",n:"Любимое дело",d:"10 тренировок одного вида",p:s=>[s.fav,10]},
  {id:"w30",t:"silver",e:"🗓️",n:"Ритуал",d:"30 утренних взвешиваний",p:s=>[s.weighIns,30]},
  {id:"q25",t:"silver",e:"📉",n:"Четверть пути",d:"25% цели",p:s=>[s.pct,25]},
+ {id:"long90",t:"silver",e:"🧱",n:"Марафонка",d:"Одна тренировка 90+ минут",p:s=>[s.maxSess,90]},
+ {id:"h10",t:"silver",e:"⌛",n:"10 часов в деле",d:"10 часов тренировок",p:s=>[Math.floor(s.min/60),10]},
+ {id:"h50",t:"gold",e:"🕰️",n:"50 часов в деле",d:"50 часов тренировок",p:s=>[Math.floor(s.min/60),50]},
  {id:"s30",t:"gold",e:"🔥",n:"Месяц без пропусков",d:"Стрик 30 дней",p:s=>[s.best,30]},
  {id:"wo50",t:"gold",e:"🏆",n:"Зверь в зале",d:"50 тренировок",p:s=>[s.wo,50]},
  {id:"q50",t:"gold",e:"⛰️",n:"Экватор",d:"Половина цели",p:s=>[s.pct,50]},
@@ -70,10 +75,15 @@ const num=v=>{const n=parseFloat(String(v).replace(",","."));return isFinite(n)?
 const fmt=n=>(Math.round(n*10)/10).toString().replace(".",",");
 const clone=o=>JSON.parse(JSON.stringify(o));
 const nowHM=()=>{const d=new Date();return pad(d.getHours())+":"+pad(d.getMinutes())};
+const toMin=hm=>{if(!hm)return null;const [h,m]=hm.split(":").map(Number);return h*60+m};
+const fromMin=m=>{m=((m%1440)+1440)%1440;return pad(Math.floor(m/60))+":"+pad(m%60)};
+function durOf(d){const a=toMin(d.wot),b=toMin(d.woe);if(a==null||b==null)return 0;let x=b-a;if(x<0)x+=1440;return x>720?0:x}
+const fmtDur=m=>{m=Math.round(m);const h=Math.floor(m/60),mm=m%60;return h?h+" ч"+(mm?" "+mm+" мин":""):mm+" мин"};
+const SNACKS=[["☕","Кофе"],["🍵","Чай"],["🍎","Фрукт"],["🥜","Орехи"],["🍫","Сладкое"],["🥛","Йогурт"],["🥤","Напиток"],["🥪","Другое"]];
 
 /* ---------- state ---------- */
-let picker=false, showCatalog=false, freezeFor=null, freezeReason=null;
-let uid=null, st=null, photos={}, board=[], tab="today", pendingMeal=null, unsubGroup=null, authMode="login";
+let picker=false, pickSel=null, snackMenu=false, snackSel=null, showCatalog=false, freezeFor=null, freezeReason=null;
+let uid=null, st=null, photos={}, board=[], tab="today", pendingPhoto=null, unsubGroup=null, authMode="login";
 
 const chains={};
 function serial(key,fn){chains[key]=(chains[key]||Promise.resolve()).then(fn).catch(onWriteErr);return chains[key]}
@@ -123,11 +133,13 @@ const REASONS=[["sick","🤒","Болею"],["trip","✈️","В поездке"
 const reasonLabel=r=>{const x=REASONS.find(z=>z[0]===r);return x?x[1]+" "+x[2]:"❄️"};
 function stats(){
   const ks=Object.keys(st.log).sort();
-  const s={weighIns:0,photos:0,full:0,wo:0,by:{},best:0,pct:pctGoal(),kinds:0,fav:0,early:0,late:0};
+  const s={weighIns:0,photos:0,full:0,wo:0,by:{},best:0,pct:pctGoal(),kinds:0,fav:0,early:0,late:0,min:0,maxSess:0,wphotos:0};
   for(const k of ks){
     const d=st.log[k];
     if(d.w!=null)s.weighIns++;
-    s.photos+=["b","l","d"].filter(m=>d["p"+m]).length;
+    s.photos+=["b","l","d"].filter(m=>d["p"+m]).length+(d.sn||[]).filter(x=>x.p).length;
+    if(d.pw)s.wphotos++;
+    if(d.wo&&d.wo!=="rest"){const du=durOf(d);s.min+=du;s.maxSess=Math.max(s.maxSess,du)}
     if(d.wo&&d.wo!=="rest"){s.wo++;s.by[d.wo]=(s.by[d.wo]||0)+1;if(d.wot&&d.wot<"10:00")s.early++;if(d.wot&&d.wot>="21:00")s.late++}
     if(isFull(k))s.full++;
   }
@@ -160,6 +172,7 @@ function boardBody(){
   const k=todayKey(),d=st.log[k]||{};
   return {nick:st.nick.slice(0,30),pct:pctGoal(),streak:streakNow(),trophies:unlockedCount(),
     day:k,w:d.w!=null,m:["b","l","d"].filter(m=>d[m]).length,wo:!!d.wo,rest:planFor(k)==="rest",frz:d.frz?d.frz.r:null,
+    wmin:(()=>{const ws=weekStart(k);let m=0;for(let i=0;i<7;i++){const x=st.log[addDays(ws,i)];if(x&&x.wo&&x.wo!=="rest")m+=durOf(x)}return m})(),
     sent:Object.fromEntries(Object.entries(st.sent||{}).filter(([,v])=>v.day===k))};
 }
 function pushBoard(force){
@@ -244,15 +257,15 @@ function notifStatus(){
 }
 
 /* ---------- photos ---------- */
-function compress(file){
+function compress(file,max=560,limit=75000){
   return new Promise((res,rej)=>{
     const img=new Image(),url=URL.createObjectURL(file);
     img.onload=()=>{
-      const max=560,sc=Math.min(1,max/Math.max(img.width,img.height));
+      const sc=Math.min(1,max/Math.max(img.width,img.height));
       const c=document.createElement("canvas");c.width=Math.round(img.width*sc);c.height=Math.round(img.height*sc);
       c.getContext("2d").drawImage(img,0,0,c.width,c.height);URL.revokeObjectURL(url);
       let q=.7,out=c.toDataURL("image/jpeg",q);
-      while(out.length>75000&&q>.3){q-=.1;out=c.toDataURL("image/jpeg",q)}
+      while(out.length>limit&&q>.3){q-=.1;out=c.toDataURL("image/jpeg",q)}
       res(out);
     };
     img.onerror=()=>{URL.revokeObjectURL(url);rej(new Error("img"))};
@@ -260,16 +273,19 @@ function compress(file){
   });
 }
 $("#photo").addEventListener("change",async e=>{
-  const f=e.target.files[0];e.target.value="";if(!f||!pendingMeal)return;
-  const m=pendingMeal;pendingMeal=null;
+  const f=e.target.files[0];e.target.value="";if(!f||!pendingPhoto)return;
+  const pp=pendingPhoto;pendingPhoto=null;
   try{
-    const data=await compress(f),k=todayKey();
-    photos[k]=photos[k]||{};photos[k][m]=data;
-    const d=day(k);d[m]=true;d["p"+m]=true;
-    const snap=clone(photos[k]);serial("ph",()=>setDoc(doc(fs,"users",uid,"photos",k),snap));
-    checkTrophies();save();render();
+    const k=todayKey(),d=day(k);
+    const data=await compress(f,pp.kind==="snack"?400:560,pp.kind==="snack"?45000:75000);
+    photos[k]=photos[k]||{};
+    if(pp.kind==="meal"){photos[k][pp.key]=data;d[pp.key]=true;d["p"+pp.key]=true}
+    else if(pp.kind==="wo"){photos[k].w=data;d.pw=true}
+    else{const sn=(d.sn||[]).find(x=>x.id===pp.key);if(!sn)return;photos[k][sn.id]=data;sn.p=true;snackSel=null}
+    savePhotos(k);checkTrophies();save();render();
   }catch(err){toastText("Не получилось загрузить фото","Попробуй другое изображение")}
 });
+function savePhotos(k){const snap=clone(photos[k]||{});serial("ph",()=>setDoc(doc(fs,"users",uid,"photos",k),snap))}
 
 /* ---------- toast ---------- */
 let toastT=null;
@@ -286,10 +302,10 @@ function toastText(a,b){showToast(`<div class="tin"><div><b>${esc(a)}</b><small>
 /* ---------- week summary ---------- */
 function weekSummary(ws){
   const end=todayKey(),days=[];for(let i=0;i<7;i++){const k=addDays(ws,i);if(k<=end)days.push(k)}
-  const r={ws,days:days.length,full:0,wo:0,by:{},meals:0,weigh:0,frz:[],tro:[],delta:null};
+  const r={ws,days:days.length,full:0,wo:0,min:0,by:{},meals:0,weigh:0,frz:[],tro:[],delta:null};
   for(const k of days){const d=st.log[k]||{};
     if(isFull(k))r.full++;if(d.frz)r.frz.push(d.frz.r);
-    if(d.wo&&d.wo!=="rest"){r.wo++;r.by[d.wo]=(r.by[d.wo]||0)+1}
+    if(d.wo&&d.wo!=="rest"){r.wo++;r.by[d.wo]=(r.by[d.wo]||0)+1;r.min+=durOf(d)}
     r.meals+=["b","l","d"].filter(m=>d[m]).length;if(d.w!=null)r.weigh++;}
   const wk=Object.keys(st.log).filter(k=>st.log[k].w!=null).sort();
   const inW=wk.filter(k=>k>=ws&&k<=addDays(ws,6)),before=wk.filter(k=>k<ws);
@@ -306,7 +322,8 @@ function summaryHTML(r,title,dismiss){
     <p class="sumverdict">${verdict}</p>
     <div class="sumgrid"><div><b>${r.full}/7</b><span class="small muted">идеальных дней</span></div><div><b>${r.wo}</b><span class="small muted">тренировок</span></div>
       <div><b>${r.meals}/${r.days*3}</b><span class="small muted">приёмов пищи</span></div><div><b>${dl||r.weigh+"/"+r.days}</b><span class="small muted">${dl?"кг за неделю":"взвешиваний"}</span></div></div>
-    ${top?`<p class="small">Чаще всего: ${top}</p>`:""}
+    ${r.min?`<p class="small">Время в тренировках: ${fmtDur(r.min)}</p>`:""}
+    ${top?`<p class="small" style="margin-top:6px">Чаще всего: ${top}</p>`:""}
     ${r.tro.length?`<p class="small" style="margin-top:6px">Новые трофеи: ${r.tro.map(t=>t.e+" "+esc(t.n)).join(", ")}</p>`:""}
     ${r.frz.length?`<p class="small" style="margin-top:6px">Заморозка: ${r.frz.map(reasonLabel).join(", ")}</p>`:""}
     ${dismiss?`<button class="linkbtn" style="margin-top:8px" data-act="sumhide" data-ws="${r.ws}">Скрыть</button>`:""}
@@ -343,6 +360,100 @@ function summaryToday(){
   if(!ws||st.sumHidden===ws)return "";
   const r=weekSummary(ws);if(!Object.keys(st.log).some(x=>x>=ws&&x<=addDays(ws,6)))return "";
   return summaryHTML(r,title,true);
+}
+
+function workoutBlock(k,d,plan,T,ph){
+  const ptime=st.planTime[parseKey(k).getDay()];
+  if(d.wo){
+    const du=durOf(d),a=act(d.wo);
+    return `<div class="band isdone">
+      <span class="big" aria-hidden="true">${a.e}</span>
+      <div class="grow"><h3>${esc(a.n)}</h3><p class="small">Сделано, ты молодец!${du?" ⏱ "+fmtDur(du):""}</p>
+        <div class="wotimes"><label>Начало <input type="time" id="wot" value="${esc(d.wot||"")}"></label><label>Конец <input type="time" id="woe" value="${esc(d.woe||"")}"></label></div></div>
+      <button class="btn" data-act="wo" aria-label="Снять отметку">✓</button>
+    </div>
+    <div class="wophoto">${ph.w?`<img src="${ph.w}" alt="Фото с тренировки"><button class="linkbtn" data-act="wophoto">Заменить фото</button>`:`<button class="btn ghost" data-act="wophoto">📷 Сфоткать, где ты была</button>`}</div>`;
+  }
+  if(d.run){
+    const a=act(d.run.a),el=Math.max(0,(Date.now()-d.run.ts)/60000);
+    return `<div class="band running">
+      <span class="big" aria-hidden="true">${a.e}</span>
+      <div class="grow"><h3>${esc(a.n)}</h3><p class="small">Началась в ${esc(d.run.s)}, идёт ${fmtDur(el)}</p></div>
+      <button class="btn" data-act="wofinish">⏹ Закончить</button>
+    </div>
+    <button class="linkbtn" style="margin-top:8px" data-act="wocancel">Отменить тренировку</button>`;
+  }
+  const rest=plan==="rest";
+  let html=`<div class="band ${rest?"rest":""}">
+    <span class="big" aria-hidden="true">${T.e}</span>
+    <div class="grow"><h3>${esc(T.n)}</h3><p class="small">${rest?"Сегодня отдыхаем, это тоже часть плана.":"По плану на сегодня"+(ptime?" в "+ptime:"")}</p></div>
+    ${rest?"":`<button class="btn" data-act="wostart" data-a="${esc(plan)}">▶️ Начать</button>`}
+  </div>
+  <button class="linkbtn" style="margin-top:8px" data-act="picker">${rest?"Всё равно тренируешься? Выбрать":"Другое занятие или уже позанималась?"}</button>`;
+  if(picker){
+    const sel=pickSel||(rest?st.activities[0]:plan);
+    html+=st.activities.length?`<div class="chips" style="margin-top:8px">${st.activities.map(id=>`<button class="chip ${sel===id?"on":""}" data-act="pickact" data-a="${esc(id)}" aria-pressed="${sel===id}">${act(id).e} ${esc(act(id).n)}</button>`).join("")}</div>
+      <div style="display:flex;gap:8px;margin-top:10px"><button class="btn" data-act="wostart" data-a="${esc(sel)}">▶️ Начать</button><button class="btn ghost" data-act="womanual" data-a="${esc(sel)}">✓ Уже сделала</button></div>`
+      :`<p class="small muted" style="margin-top:8px">Добавь активности во вкладке «Зал»</p>`;
+  }
+  return html;
+}
+function snackBlock(k,d,ph){
+  const sn=d.sn||[];
+  let html=`<h2>Перекусы</h2><div class="snacks">${sn.map(x=>`<button class="snack ${snackSel===x.id?"sel":""}" data-act="snsel" data-id="${esc(x.id)}" aria-label="${esc(x.n)} в ${esc(x.t)}">
+      ${ph[x.id]?`<img src="${ph[x.id]}" alt="">`:`<span class="semo" aria-hidden="true">${x.e}</span>`}<span class="sl">${esc(x.n)}<small>${esc(x.t)}</small></span></button>`).join("")}
+    ${sn.length<8?`<button class="snack add" data-act="snadd" aria-expanded="${snackMenu}"><span class="semo" aria-hidden="true">＋</span><span class="sl">Перекус</span></button>`:""}</div>`;
+  if(snackMenu)html+=`<div class="chips" style="margin-top:10px">${SNACKS.map(([e,n],i)=>`<button class="chip" data-act="snnew" data-i="${i}">${e} ${n}</button>`).join("")}</div>`;
+  const cur=sn.find(x=>x.id===snackSel);
+  if(cur)html+=`<div style="display:flex;gap:8px;margin-top:10px"><button class="btn ghost" data-act="snphoto" data-id="${esc(cur.id)}">📷 ${ph[cur.id]?"Заменить фото":"Фото"}</button><button class="btn ghost" data-act="sndel" data-id="${esc(cur.id)}">🗑 Удалить</button></div>`;
+  return html;
+}
+function waterBlock(d){
+  const n=d.wa||0,g=st.water.goal;
+  return `<h2>Вода</h2><div class="water">
+    <button class="btn ghost" data-act="water" data-d="-1" aria-label="Минус стакан" ${n?"":"disabled"}>−</button>
+    <div class="glasses" aria-label="${n} из ${g} стаканов">${Array.from({length:Math.max(g,n)},(_,i)=>`<span class="${i<n?"on":""}">💧</span>`).join("")}</div>
+    <button class="btn" data-act="water" data-d="1" aria-label="Плюс стакан">+</button>
+  </div><p class="small muted" style="margin-top:6px">${n} из ${g} стаканов по 250 мл${n>=g?" 🎉":""}</p>`;
+}
+
+/* ---------- charts ---------- */
+function barsSVG(items,unit){
+  const W=320,H=150,pb=22,pt=16,bw=(W-20)/items.length,max=Math.max(1,...items.map(x=>x.v));
+  return `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="Минуты тренировок по неделям">${items.map((x,i)=>{
+    const h=(H-pb-pt)*x.v/max,xx=10+i*bw+bw*.18,w=bw*.64,y=H-pb-h;
+    return `<rect x="${xx.toFixed(1)}" y="${y.toFixed(1)}" width="${w.toFixed(1)}" height="${Math.max(h,x.v?2:0).toFixed(1)}" rx="5" fill="${x.hi?"var(--accent)":"var(--sunk)"}" stroke="var(--accent)" stroke-opacity="${x.hi?0:.35}"/>
+      ${x.v?`<text x="${(xx+w/2).toFixed(1)}" y="${(y-4).toFixed(1)}" text-anchor="middle" font-size="9" fill="var(--muted)" font-family="Manrope">${x.lab2}</text>`:""}
+      <text x="${(xx+w/2).toFixed(1)}" y="${H-6}" text-anchor="middle" font-size="9" fill="var(--muted)" font-family="Manrope">${x.lab}</text>`}).join("")}</svg>`;
+}
+function hbars(rows){
+  const max=Math.max(1,...rows.map(r=>r.v));
+  return rows.map(r=>`<div class="hb"><span class="hbl">${r.l}</span><div class="hbt"><i style="width:${(r.v/max*100).toFixed(1)}%"></i></div><span class="hbv">${r.t}</span></div>`).join("");
+}
+function statsBlock(){
+  const tk=todayKey(),ws0=weekStart(tk),weeks=[];
+  for(let w=7;w>=0;w--){const ws=addDays(ws0,-7*w);let m=0;for(let i=0;i<7;i++){const d=st.log[addDays(ws,i)];if(d&&d.wo&&d.wo!=="rest")m+=durOf(d)}
+    weeks.push({v:m,lab:parseKey(ws).toLocaleDateString("ru-RU",{day:"numeric",month:"numeric"}),lab2:m>=60?Math.round(m/6)/10+"ч":m+"м",hi:w===0})}
+  const by={},tod={morning:0,day:0,evening:0};let total=0,n=0,cnt={};
+  for(const d of Object.values(st.log)){if(!d.wo||d.wo==="rest")continue;const du=durOf(d);by[d.wo]=(by[d.wo]||0)+du;cnt[d.wo]=(cnt[d.wo]||0)+1;
+    if(du){total+=du;n++}const t=toMin(d.wot);if(t!=null){tod[t<720?"morning":t<1080?"day":"evening"]++}}
+  if(!Object.keys(cnt).length)return "";
+  const actRows=Object.keys(cnt).sort((a,b)=>(by[b]||0)-(by[a]||0)||cnt[b]-cnt[a]).slice(0,6).map(id=>({l:act(id).e+" "+esc(act(id).n),v:by[id]||cnt[id],t:by[id]?fmtDur(by[id]):cnt[id]+"×"}));
+  const todRows=[{l:"🌅 Утро",v:tod.morning,t:tod.morning},{l:"☀️ День",v:tod.day,t:tod.day},{l:"🌙 Вечер",v:tod.evening,t:tod.evening}];
+  return `<h2>Статистика</h2>
+  <div class="statgrid"><div><b>${total?fmtDur(total):"0"}</b><span class="small muted">всего в тренировках</span></div><div><b>${n?fmtDur(total/n):"–"}</b><span class="small muted">в среднем за раз</span></div></div>
+  <div class="chart"><p class="small" style="font-weight:700;margin-bottom:4px">Минуты по неделям</p>${barsSVG(weeks)}</div>
+  <div class="chart"><p class="small" style="font-weight:700;margin-bottom:8px">По видам</p>${hbars(actRows)}</div>
+  ${tod.morning+tod.day+tod.evening?`<div class="chart"><p class="small" style="font-weight:700;margin-bottom:8px">Когда ты тренируешься</p>${hbars(todRows)}</div>`:""}`;
+}
+function heatmap(){
+  const tk=todayKey(),start=addDays(weekStart(tk),-7*11);let cells="";
+  for(let w=0;w<12;w++)for(let i=0;i<7;i++){const k=addDays(start,w*7+i);const d=st.log[k]||{};
+    const cls=k>tk?"fut":isFull(k)?"full":d.frz?"frz":Object.keys(d).length?"part":"";
+    cells+=`<i class="${cls}" style="grid-column:${w+1};grid-row:${i+1}" title="${k}"></i>`}
+  return `<div class="chart"><p class="small" style="font-weight:700;margin-bottom:8px">Последние 12 недель</p>
+    <div class="heat">${cells}</div>
+    <div class="heatleg small muted"><span><i class="full"></i>идеальный день</span><span><i class="part"></i>частично</span><span><i class="frz"></i>заморожен</span></div></div>`;
 }
 
 /* ---------- views ---------- */
@@ -397,15 +508,10 @@ function viewToday(){
   <h2>Еда сегодня</h2>
   <div class="meals">${meals}</div>
   <p class="small muted mealhint">Нажми на название, чтобы добавить фото. Фото видишь только ты.</p>
+  ${snackBlock(k,d,ph)}
+  ${st.water.on?waterBlock(d):""}
   <h2>Тренировка</h2>
-  <div class="band ${plan==="rest"&&!d.wo?"rest":""} ${d.wo?"isdone":""}">
-    <span class="big" aria-hidden="true">${(d.wo?act(d.wo):T).e}</span>
-    <div class="grow"><h3>${esc((d.wo?act(d.wo):T).n)}</h3><p class="small">${d.wo?"Сделано, ты молодец!":plan==="rest"?"Сегодня отдыхаем, это тоже часть плана.":"По плану на сегодня"+(st.planTime[parseKey(k).getDay()]?" в "+st.planTime[parseKey(k).getDay()]:"")}</p>
-      ${d.wo?`<label class="small wotl">Во сколько <input type="time" id="wot" value="${esc(d.wot||"")}"></label>`:""}</div>
-    ${d.wo?`<button class="btn" data-act="wo">✓ Сделала</button>`:plan==="rest"?"":`<button class="btn" data-act="wo">Отметить</button>`}
-  </div>
-  ${d.wo?"":`<button class="linkbtn" style="margin-top:8px" data-act="picker">${plan==="rest"?"Всё равно потренировалась? Отметить":"Сделала другое? Выбрать"}</button>`}
-  ${picker&&!d.wo?`<div class="chips" style="margin-top:8px">${st.activities.map(id=>`<button class="chip" data-act="wopick" data-a="${esc(id)}">${act(id).e} ${esc(act(id).n)}</button>`).join("")||`<span class="small muted">Добавь активности во вкладке «Зал»</span>`}</div>`:""}
+  ${workoutBlock(k,d,plan,T,ph)}
   <h2>Путь к цели</h2>
   <div class="prow"><b>${pctGoal()}%</b><span class="muted small">${fmt(st.start)} → ${fmt(st.goal)} кг до ${parseKey(st.deadline).toLocaleDateString("ru-RU",{day:"numeric",month:"long"})}</span></div>
   <div class="bar"><i style="width:${pctGoal()}%"></i></div>
@@ -439,6 +545,7 @@ function viewGym(){
   <h2>Мой план на неделю</h2><p class="small muted" style="margin:-4px 0 12px">Выбери активность и время для каждого дня. В дни отдыха тренировка не нужна для стрика.</p>
   <div class="plan">${rows}</div>
   ${counts?`<h2>Всего тренировок</h2><div class="counts">${counts}</div>`:""}
+  ${statsBlock()}
   ${(()=>{const ws=weekStart(addDays(start,-1));return Object.keys(st.log).some(x=>x>=ws&&x<start)?summaryHTML(weekSummary(ws),"Итоги прошлой недели",false):""})()}`;
 }
 function trophyRow(t,s){
@@ -456,6 +563,7 @@ function viewTrophies(){
   const platGot=!!(st.unlocked||{}).plat,pr=(st.prizes||{}).plat||"";
   let html=`<h1>Трофеи</h1>
   <div class="summary"><div><b>${got}/${TROPHIES.length}</b><span class="small muted">получено</span></div><div><b>🔥${s.best}</b><span class="small muted">лучший стрик</span></div><div><b>${s.full}</b><span class="small muted">идеальных дней</span></div></div>
+  ${heatmap()}
   <div class="platcard"><div style="display:flex;gap:16px;align-items:center">
     <div class="medal" style="--tc:var(--plat);${platGot?"":"filter:grayscale(.6);opacity:.7"}">${plat.e}</div>
     <div><h3 style="font-family:var(--display);font-size:1.15rem">Платина</h3><p class="small">${platGot?"Цель достигнута! 🎉":"Доберись до цели: "+fmt(st.goal)+" кг. Сейчас "+s.pct+"%"}</p></div></div>
@@ -480,6 +588,7 @@ function viewTogether(){
       <div class="stats"><span>🔥${p.streak||0}</span><span>🏆${p.trophies||0}</span></div></div>
       <div class="prow" style="margin-bottom:6px"><span class="small muted">Путь к цели</span><b style="font-size:1rem">${p.pct||0}%</b></div>
       <div class="bar"><i style="width:${p.pct||0}%"></i></div>
+      ${p.wmin?`<p class="small muted" style="margin-top:8px">⏱ ${fmtDur(p.wmin)} тренировок на этой неделе</p>`:""}
       <div class="today">${today&&p.frz?`<span>❄️ День заморожен: ${esc(reasonLabel(p.frz))}</span>`:today?`<span>${p.w?"✅":"⬜"} вес</span><span>${p.m||0}/3 еда</span><span>${p.rest?"😴 отдых":p.wo?"✅ тренировка":"⬜ тренировка"}</span>`:"<span>Сегодня ещё не заходила</span>"}</div>
       ${(()=>{const rec=received(p.id);return rec.length?`<p class="recv">${rec.map(r=>`${r.e} ${esc(r.nick)}`).join(", ")}</p>`:""})()}
       ${me?"":`<div class="reacts">${REACTS.map(e=>{const on=(st.sent||{})[p.id]&&st.sent[p.id].day===tk&&st.sent[p.id].e===e;return `<button class="rbtn ${on?"on":""}" data-act="react" data-to="${esc(p.id)}" data-e="${e}" aria-pressed="${on}" aria-label="Реакция ${e} для ${esc(p.nick||"")}">${e}</button>`}).join("")}</div>`}
@@ -513,6 +622,10 @@ function viewGoal(){
   ${window.Notification?.permission==="granted"&&st.remind.on
     ?`<button class="btn ghost" style="margin-top:14px" data-act="notifoff">Выключить уведомления</button>`
     :`<button class="btn block" style="margin-top:14px" data-act="notif">Включить уведомления 🔔</button>`}
+  <h2>Вода</h2>
+  <label class="check"><input type="checkbox" id="w-on" ${st.water.on?"checked":""}> Считать воду на вкладке «Сегодня»</label>
+  ${st.water.on?`<label for="w-goal">Цель на день</label><select id="w-goal">${[4,5,6,7,8,9,10,12].map(n=>`<option value="${n}" ${st.water.goal===n?"selected":""}>${n} стаканов (${n*250} мл)</option>`).join("")}</select>`:""}
+  <p class="small muted" style="margin-top:6px">Необязательно и не влияет на стрик.</p>
   <h2>Начать заново</h2><p class="small muted" style="margin-bottom:10px">Сотрёт записи, стрик и трофеи. Призы и план тренировок останутся.</p>
   <button class="btn ghost" data-act="reset">Сбросить прогресс</button>
   <h2>Аккаунт</h2><p class="small muted" style="margin-bottom:10px">${esc(auth.currentUser?.email||"")}</p>
@@ -566,7 +679,7 @@ onAuthStateChanged(auth,async u=>{
   try{const s=await getDoc(doc(fs,"users",uid));loaded=s.exists()?s.data():null}catch(e){console.warn(e)}
   st=Object.assign({v:1,nick:"",start:null,goal:null,deadline:null,startDate:null,plan:{...DEF_PLAN},prizes:{},log:{},unlocked:{},group:null},loaded||{});
   st.remind=Object.assign({weigh:9,meals:true,on:false},st.remind||{});
-  st.custom=st.custom||[];st.planTime=st.planTime||{};
+  st.custom=st.custom||[];st.planTime=st.planTime||{};st.water=Object.assign({on:false,goal:8},st.water||{});
   if(!Array.isArray(st.activities)){const fromPlan=[...new Set(Object.values(st.plan).filter(x=>x!=="rest"))];st.activities=fromPlan.length?fromPlan:["leg","arm","cardio"]}
   const tz=Intl.DateTimeFormat().resolvedOptions().timeZone;
   if(st.tz!==tz){st.tz=tz;if(loaded)save()}
@@ -598,9 +711,33 @@ document.addEventListener("click",async e=>{
   }else if(action==="meal"){
     const d=day(k),m=a.dataset.m;d[m]=!d[m];checkTrophies();save();render();
   }else if(action==="photo"){
-    pendingMeal=a.dataset.m;$("#photo").click();
+    pendingPhoto={kind:"meal",key:a.dataset.m};$("#photo").click();
+  }else if(action==="wophoto"){pendingPhoto={kind:"wo"};$("#photo").click();
+  }else if(action==="wostart"){
+    const d=day(k);d.run={a:a.dataset.a,s:nowHM(),ts:Date.now()};picker=false;pickSel=null;save();render();
+  }else if(action==="wofinish"){
+    const d=day(k);if(!d.run)return;d.wo=d.run.a;d.wot=d.run.s;d.woe=nowHM();delete d.run;
+    checkTrophies();save();render();toastText("Тренировка закончена 💪",fmtDur(durOf(d))+", можно сфоткать, где ты была");
+  }else if(action==="wocancel"){if(!confirm("Отменить тренировку?"))return;delete day(k).run;save();render();
+  }else if(action==="womanual"){
+    const d=day(k),pt=st.planTime[parseKey(k).getDay()],now=toMin(nowHM());
+    d.wo=a.dataset.a;d.woe=nowHM();d.wot=pt&&toMin(pt)<now?pt:fromMin(now-60);
+    picker=false;pickSel=null;checkTrophies();save();render();
+  }else if(action==="pickact"){pickSel=a.dataset.a;render();
+  }else if(action==="snadd"){snackMenu=!snackMenu;snackSel=null;render();
+  }else if(action==="snnew"){
+    const [e,n]=SNACKS[+a.dataset.i],d=day(k);d.sn=d.sn||[];if(d.sn.length>=8)return;
+    const id="s"+Date.now().toString(36);d.sn.push({id,e,n,t:nowHM()});snackMenu=false;snackSel=id;save();render();
+  }else if(action==="snsel"){snackSel=snackSel===a.dataset.id?null:a.dataset.id;snackMenu=false;render();
+  }else if(action==="snphoto"){pendingPhoto={kind:"snack",key:a.dataset.id};$("#photo").click();
+  }else if(action==="sndel"){
+    const d=day(k),id=a.dataset.id;d.sn=(d.sn||[]).filter(x=>x.id!==id);
+    if(photos[k]&&photos[k][id]){delete photos[k][id];savePhotos(k)}
+    snackSel=null;save();render();
+  }else if(action==="water"){
+    const d=day(k);d.wa=Math.max(0,(d.wa||0)+Number(a.dataset.d));save();render();
   }else if(action==="wo"){
-    const d=day(k);if(d.wo){delete d.wo;delete d.wot}else{d.wo=planFor(k);d.wot=nowHM()}checkTrophies();save();render();
+    const d=day(k);if(!d.wo)return;if(!confirm("Снять отметку о тренировке?"))return;delete d.wo;delete d.wot;delete d.woe;checkTrophies();save();render();
   }else if(action==="frzopen"){freezeFor=a.dataset.k;freezeReason=null;render();
   }else if(action==="frzreason"){const note=$("#frz-note")?.value||"";freezeReason=a.dataset.r;render();const n=$("#frz-note");if(n)n.value=note;
   }else if(action==="frzcancel"){freezeFor=null;freezeReason=null;render();
@@ -617,9 +754,8 @@ document.addEventListener("click",async e=>{
     if(cur&&cur.day===k&&cur.e===e)delete st.sent[to];else st.sent[to]={day:k,e};
     for(const [id,v] of Object.entries(st.sent))if(v.day!==k)delete st.sent[id];
     save();pushBoard();render();
-  }else if(action==="picker"){picker=!picker;render();
-  }else if(action==="wopick"){
-    day(k).wo=a.dataset.a;day(k).wot=nowHM();picker=false;checkTrophies();save();render();
+  }else if(action==="picker"){picker=!picker;pickSel=null;render();
+
   }else if(action==="catalog"){showCatalog=!showCatalog;render();
   }else if(action==="acttoggle"){
     const id=a.dataset.a;
@@ -657,7 +793,9 @@ document.addEventListener("change",e=>{
   const p=e.target.dataset&&e.target.dataset.prize;
   if(p){st.prizes=st.prizes||{};const v=e.target.value.trim().slice(0,80);if(v)st.prizes[p]=v;else delete st.prizes[p];save();return}
   if(e.target.dataset&&e.target.dataset.ptime!=null){const w=e.target.dataset.ptime;if(e.target.value)st.planTime[w]=e.target.value;else delete st.planTime[w];save();return}
-  if(e.target.id==="wot"){const d=day(todayKey());if(e.target.value)d.wot=e.target.value;else delete d.wot;checkTrophies();save();return}
+  if(e.target.id==="wot"||e.target.id==="woe"){const d=day(todayKey()),f=e.target.id;if(e.target.value)d[f]=e.target.value;else delete d[f];checkTrophies();save();render();return}
+  if(e.target.id==="w-on"){st.water.on=e.target.checked;save();render();return}
+  if(e.target.id==="w-goal"){st.water.goal=Number(e.target.value);save();return}
   if(e.target.id==="r-hour"){st.remind.weigh=Number(e.target.value);save()}
   if(e.target.id==="r-meals"){st.remind.meals=e.target.checked;save()}
 });
@@ -671,4 +809,5 @@ document.addEventListener("keydown",e=>{
   if(e.target.id==="w")$('[data-act="weigh"]').click();
   if(e.target.id==="l-pass")$('[data-act="login"],[data-act="signup"]').click();
 });
+setInterval(()=>{if(st&&tab==="today"&&(st.log[todayKey()]||{}).run&&document.visibilityState==="visible"&&!document.activeElement.matches("input"))render()},30000);
 document.addEventListener("visibilitychange",()=>{if(document.visibilityState==="visible"&&st&&st.goal!=null&&!document.activeElement.matches("input"))render()});
